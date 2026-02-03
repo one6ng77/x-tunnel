@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # ==========================================
-# Suoha X-Tunnel [ULTIMATE EDITION]
-# Author: Gemini Optimized
-# Features: BBR, QUIC/HTTP2 Switch, UX Enhanced
+# Suoha X-Tunnel [CLEAN EDITION]
+# Features: Custom Socks5, BBR, QUIC/HTTP2
 # ==========================================
 
 set -u
@@ -52,21 +51,18 @@ check_root() {
 
 # --- 核心功能模块 ---
 
-# 1. 智能系统优化 (带环境检测)
+# 1. 智能系统优化
 optimize_system() {
     echo -e "${YELLOW}正在检查系统环境并尝试优化...${PLAIN}"
     
-    # 检测是否为容器环境 (Docker/LXC)
     if systemd-detect-virt | grep -qE "lxc|docker|wsl"; then
         log warn "检测到虚拟化容器环境，跳过内核参数修改 (BBR)，仅优化进程限制。"
     else
-        # 物理机或 KVM/Xen 虚拟机，执行全量优化
         if ! grep -q "tcp_congestion_control = bbr" /etc/sysctl.conf; then
             echo "net.core.default_qdisc = fq" >> /etc/sysctl.conf
             echo "net.ipv4.tcp_congestion_control = bbr" >> /etc/sysctl.conf
         fi
         
-        # 写入优化参数
         cat > /etc/sysctl.d/99-suoha.conf <<EOF
 net.core.rmem_max = 67108864
 net.core.wmem_max = 67108864
@@ -79,7 +75,6 @@ EOF
         log success "BBR 及内核参数优化已应用"
     fi
 
-    # 通用优化：文件描述符
     ulimit -n 512000
     echo "* soft nofile 512000" > /etc/security/limits.d/suoha.conf
     echo "* hard nofile 512000" >> /etc/security/limits.d/suoha.conf
@@ -101,7 +96,6 @@ install_deps() {
         pm_cmd="apt install -y"
     fi
     
-    # 这一步后台运行，显示动画
     ($pm_cmd curl screen lsof tar grep >/dev/null 2>&1) & spinner
     log success "依赖安装完成"
 }
@@ -117,14 +111,12 @@ download_binaries() {
 
     log info "开始下载组件 (Cloudflared + X-Tunnel + Opera)..."
     
-    # 定义下载函数
     dl() {
         local url="$1"
         local path="$2"
         if [[ ! -f "$path" ]]; then
-            # 使用 curl 显示进度条但只有关键信息
             if ! curl -L --progress-bar --connect-timeout 10 --retry 3 "$url" -o "$path"; then
-                echo "" # 换行
+                echo "" 
                 log error "下载失败: $path"
                 return 1
             fi
@@ -157,10 +149,10 @@ stop_all() {
     screen -ls | grep -E "suoha_core|suoha_opera|suoha_argo|suoha_bind" | awk '{print $1}' | xargs -r -I{} screen -X -S {} quit
 }
 
-# 6. 启动服务 (核心逻辑)
+# 6. 启动服务
 start_services() {
-    local opera_on="$1"
-    local opera_region="$2"
+    local proxy_mode="$1"    # 0=直连, 1=Opera, 2=自定义
+    local proxy_val="$2"     # Opera地区 或 SOCKS5地址
     local proto="$3"
     local port="$4"
     local ip_ver="$5"
@@ -172,14 +164,19 @@ start_services() {
     local ws_port="${port:-$(get_random_port)}"
     local metrics_port=$(get_random_port)
     
-    # --- 启动 Opera ---
+    # --- 处理落地代理 ---
     local proxy_chain=""
-    if [[ "$opera_on" == "1" ]]; then
+    if [[ "$proxy_mode" == "1" ]]; then
+        # Opera 模式
         local op_port=$(get_random_port)
-        log info "正在启动 Opera 前置代理 (地区: $opera_region)..."
-        screen -dmS suoha_opera "$BIN_DIR/opera-linux" -country "$opera_region" -socks-mode -bind-address "127.0.0.1:${op_port}"
+        log info "正在启动 Opera 前置代理 (地区: $proxy_val)..."
+        screen -dmS suoha_opera "$BIN_DIR/opera-linux" -country "$proxy_val" -socks-mode -bind-address "127.0.0.1:${op_port}"
         proxy_chain="-f socks5://127.0.0.1:${op_port}"
         sleep 1
+    elif [[ "$proxy_mode" == "2" ]]; then
+        # 自定义 Socks5 模式
+        log info "正在配置自定义落地代理 ($proxy_val)..."
+        proxy_chain="-f socks5://${proxy_val}"
     fi
 
     # --- 启动 X-Tunnel ---
@@ -189,7 +186,7 @@ start_services() {
     [[ -n "$proxy_chain" ]] && xt_cmd+=" $proxy_chain"
     screen -dmS suoha_core bash -c "$xt_cmd"
 
-    # --- 启动 Cloudflared (Argo) ---
+    # --- 启动 Cloudflared ---
     local proto_flag="--protocol http2"
     [[ "$proto" == "quic" ]] && proto_flag="--protocol quic"
 
@@ -200,7 +197,7 @@ start_services() {
         $proto_flag --no-autoupdate \
         --url "127.0.0.1:${ws_port}" --metrics "127.0.0.1:${metrics_port}"
 
-    # Named Tunnel (Bind Domain)
+    # Named Tunnel
     if [[ "$bind_on" == "1" ]]; then
         screen -dmS suoha_bind "$BIN_DIR/cloudflared-linux" tunnel --edge-ip-version "$ip_ver" \
             $proto_flag run --token "$cf_tk"
@@ -229,17 +226,19 @@ temp_domain=${domain_found}
 bind_enable=${bind_on}
 xt_token=${xt_tk}
 cf_proto=${proto}
+proxy_mode=${proxy_mode}
 EOF
     
-    display_result "$domain_found" "$ws_port" "$bind_on" "$proto"
+    display_result "$domain_found" "$ws_port" "$bind_on" "$proto" "$proxy_mode"
 }
 
-# 7. 显示结果面板
+# 7. 显示结果面板 (已移除客户端提示)
 display_result() {
     local domain="$1"
     local port="$2"
     local bind="$3"
     local proto="$4"
+    local pm="$5"
 
     clear
     echo -e "=================================================="
@@ -247,6 +246,15 @@ display_result() {
     echo -e "=================================================="
     echo -e "传输协议 : ${GREEN}${proto^^}${PLAIN} (QUIC=UDP / HTTP2=TCP)"
     echo -e "本地端口 : ${YELLOW}${port}${PLAIN}"
+    
+    if [[ "$pm" == "0" ]]; then
+        echo -e "落地策略 : ${BLUE}直连 (Direct)${PLAIN}"
+    elif [[ "$pm" == "1" ]]; then
+        echo -e "落地策略 : ${GREEN}Opera VPN${PLAIN}"
+    else
+        echo -e "落地策略 : ${YELLOW}自定义 SOCKS5${PLAIN}"
+    fi
+
     echo -e "--------------------------------------------------"
     
     if [[ -n "$domain" ]]; then
@@ -261,12 +269,6 @@ display_result() {
     else
         echo -e "绑定域名 : 未启用"
     fi
-    echo -e "--------------------------------------------------"
-    echo -e "客户端配置提示:"
-    echo -e "1. 地址(Address) -> 优选IP 或 脚本生成的域名"
-    echo -e "2. 端口(Port)    -> 443"
-    echo -e "3. 伪装域名(SNI) -> 上面的域名"
-    echo -e "4. 路径(Path)    -> / (默认)"
     echo -e "=================================================="
 }
 
@@ -295,7 +297,7 @@ wizard() {
 
             echo -e "\n${YELLOW}--- 配置向导 (直接回车使用默认值) ---${PLAIN}"
             
-            # 1. 协议选择 (关键优化)
+            # 1. 协议选择
             echo -e "\n[1/6] 请选择传输协议:"
             echo -e "  1. QUIC  (UDP, 速度极快, 抗丢包, 但可能被运营商限速)"
             echo -e "  2. HTTP2 (TCP, 稳定性高, 兼容性好, 速度一般)"
@@ -308,15 +310,26 @@ wizard() {
             read -r -p "选择 (4=IPv4, 6=IPv6) [默认 4]: " ip_ver
             ip_ver=${ip_ver:-4}
 
-            # 3. Opera 前置
-            echo -e "\n[3/6] 是否启用 Opera 免费 VPN 链式代理? (用于解锁流媒体/更换IP)"
-            read -r -p "启用? (y/n) [默认 n]: " use_opera
-            local opera_on=0
-            local opera_region="AM"
-            if [[ "$use_opera" == "y" ]]; then
-                opera_on=1
-                read -r -p "选择地区 (AM=美洲, EU=欧洲, AS=亚洲) [默认 AM]: " opera_region
-                opera_region=${opera_region:-AM}
+            # 3. 落地策略
+            echo -e "\n[3/6] 选择落地策略 (流量出口):"
+            echo -e "  1. 直连 (默认, 流量直接从本机出去)"
+            echo -e "  2. Opera 免费 VPN (自动轮换 IP)"
+            echo -e "  3. 自定义 SOCKS5 (填你自己的代理)"
+            read -r -p "选择 [1]: " proxy_choice
+            proxy_choice=${proxy_choice:-1}
+            
+            local proxy_mode=0
+            local proxy_val=""
+            
+            if [[ "$proxy_choice" == "2" ]]; then
+                proxy_mode=1
+                read -r -p "选择 Opera 地区 (AM=美洲, EU=欧洲, AS=亚洲) [默认 AM]: " proxy_val
+                proxy_val=${proxy_val:-AM}
+            elif [[ "$proxy_choice" == "3" ]]; then
+                proxy_mode=2
+                echo -e "${YELLOW}格式说明: IP:端口 或 用户:密码@IP:端口${PLAIN}"
+                read -r -p "输入 SOCKS5 链接: " proxy_val
+                if [[ -z "$proxy_val" ]]; then log error "SOCKS5 链接不能为空"; exit 1; fi
             fi
 
             # 4. 端口固定
@@ -344,12 +357,10 @@ wizard() {
                 fi
             fi
 
-            # 清理旧环境并启动
             stop_all
-            # 将绑定域名存入变量以便 display 使用
             bind_domain="$global_bind_domain" 
             
-            start_services "$opera_on" "$opera_region" "$proto" "$fixed_port" "$ip_ver" "$xt_token" "$bind_on" "$cf_token"
+            start_services "$proxy_mode" "$proxy_val" "$proto" "$fixed_port" "$ip_ver" "$xt_token" "$bind_on" "$cf_token"
             ;;
         2)
             stop_all
@@ -363,7 +374,8 @@ wizard() {
         4)
             if [[ -f "$CONFIG_FILE" ]]; then
                 source "$CONFIG_FILE"
-                display_result "$temp_domain" "$ws_port" "$bind_enable" "$cf_proto"
+                local p_mode=${proxy_mode:-0}
+                display_result "$temp_domain" "$ws_port" "$bind_enable" "$cf_proto" "$p_mode"
             else
                 log warn "未检测到运行配置。"
             fi
