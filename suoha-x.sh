@@ -43,6 +43,14 @@ optimize_system() {
     if systemd-detect-virt | grep -qE "lxc|docker|wsl"; then
         log warn "容器环境：跳过内核参数修改，仅优化连接数限制。"
     else
+        local cc_algo="bbr2"
+        local qdisc_algo="fq"
+        if ! grep -q "bbr2" /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+            cc_algo="bbr"
+            modprobe tcp_bbr 2>/dev/null
+        fi
+
+=======
         local cc_algo="bbr"
         if grep -q "bbr2" /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
             cc_algo="bbr2"
@@ -55,7 +63,6 @@ optimize_system() {
             tc qdisc del dev lo root >/dev/null 2>&1 || true
             qdisc_algo="fq"
         fi
-
         cat > /etc/sysctl.d/99-suoha-speed.conf <<EOF
 # --- 拥塞控制 ---
 net.core.default_qdisc = ${qdisc_algo}
