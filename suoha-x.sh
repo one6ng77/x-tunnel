@@ -43,29 +43,38 @@ optimize_system() {
     if systemd-detect-virt | grep -qE "lxc|docker|wsl"; then
         log warn "容器环境：跳过内核参数修改，仅优化连接数限制。"
     else
-        modprobe tcp_bbr 2>/dev/null
+        local cc_algo="bbr2"
+        local qdisc_algo="fq"
+        if ! grep -q "bbr2" /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+            cc_algo="bbr"
+            modprobe tcp_bbr 2>/dev/null
+        fi
+
         cat > /etc/sysctl.d/99-suoha-speed.conf <<EOF
 # --- 拥塞控制 ---
-net.core.default_qdisc = fq_codel
-net.ipv4.tcp_congestion_control = bbr
+net.core.default_qdisc = ${qdisc_algo}
+net.ipv4.tcp_congestion_control = ${cc_algo}
 
 # --- 降低延迟关键参数 ---
 net.ipv4.tcp_notsent_lowat = 16384
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_no_metrics_save = 1
 
 # --- 连接性能 ---
 net.ipv4.tcp_fastopen = 3
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_keepalive_time = 300
+net.ipv4.tcp_fin_timeout = 15
 net.core.somaxconn = 8192
+net.core.netdev_max_backlog = 16384
 net.core.rmem_max = 33554432
 net.core.wmem_max = 33554432
 net.ipv4.tcp_rmem = 4096 87380 33554432
 net.ipv4.tcp_wmem = 4096 16384 33554432
 EOF
         sysctl -p /etc/sysctl.d/99-suoha-speed.conf >/dev/null 2>&1 || true
-        log success "内核优化完成"
+        log success "内核优化完成 (${qdisc_algo} + ${cc_algo})"
     fi
 
     ulimit -n 1000000
@@ -143,6 +152,7 @@ display_result() {
     local bind="$3"
     local proto="$4"
     local pm="$5"
+    local cf_count="${6:-1}"
 
     clear
     echo -e "=================================================="
@@ -150,6 +160,7 @@ display_result() {
     echo -e "=================================================="
     echo -e "系统内核 : ${GREEN}fq_codel + BBR + LowLatency${PLAIN}"
     echo -e "传输协议 : ${YELLOW}${proto^^}${PLAIN} (无压缩)"
+    echo -e "隧道数量 : ${GREEN}${cf_count}${PLAIN}"
     echo -e "--------------------------------------------------"
     echo -e "🔑 本地端口 : ${GREEN}${port}${PLAIN}  <--- 请复制这个端口"
     echo -e "--------------------------------------------------"
@@ -185,6 +196,7 @@ start_services() {
     local xt_tk="$6"
     local bind_on="$7"
     local cf_tk="$8"
+    local cf_count="${9:-1}"
 
     local ws_port="${port:-$(get_random_port)}"
     local metrics_port=$(get_random_port)
@@ -210,8 +222,14 @@ start_services() {
 
     # 启动 Cloudflared (无压缩)
     local cf_args="tunnel --edge-ip-version $ip_ver --no-autoupdate --compression-quality 0 --protocol $proto"
-    log info "启动 Cloudflare 隧道..."
-    screen -dmS suoha_argo "$BIN_DIR/cloudflared-linux" $cf_args --url "127.0.0.1:${ws_port}" --metrics "127.0.0.1:${metrics_port}"
+    log info "启动 Cloudflare 隧道 (x${cf_count})..."
+    for i in $(seq 1 "${cf_count}"); do
+        local cf_metrics_port="${metrics_port}"
+        if [[ "$i" -ne 1 ]]; then
+            cf_metrics_port=$(get_random_port)
+        fi
+        screen -dmS "suoha_argo_${i}" "$BIN_DIR/cloudflared-linux" $cf_args --url "127.0.0.1:${ws_port}" --metrics "127.0.0.1:${cf_metrics_port}"
+    done
 
     if [[ "$bind_on" == "1" ]]; then
         screen -dmS suoha_bind "$BIN_DIR/cloudflared-linux" $cf_args run --token "$cf_tk"
@@ -241,10 +259,11 @@ bind_enable=${bind_on}
 xt_token=${xt_tk}
 cf_proto=${proto}
 proxy_mode=${proxy_mode}
+cf_count=${cf_count}
 EOF
     
     # === 这里调用显示结果 ===
-    display_result "$domain_found" "$ws_port" "$bind_on" "$proto" "$proxy_mode"
+    display_result "$domain_found" "$ws_port" "$bind_on" "$proto" "$proxy_mode" "$cf_count"
 }
 
 # --- 主菜单 ---
@@ -292,18 +311,27 @@ wizard() {
             echo -e "\n[4/6] WS 端口 (留空随机):"; read -r -p "端口: " fixed_port
             echo -e "\n[5/6] X-Tunnel Token (留空无):"; read -r -p "Token: " xt_tk
             
+            # 并发隧道数量
+            echo -e "\n[6/7] 并发隧道数量 (建议 1-4):"
+            read -r -p "数量 [1]: " cf_count
+            cf_count=${cf_count:-1}
+            if ! [[ "$cf_count" =~ ^[0-9]+$ ]] || [[ "$cf_count" -lt 1 ]]; then
+                log warn "隧道数量无效，已回退为 1"
+                cf_count=1
+            fi
+
             # 绑定
-            echo -e "\n[6/6] 绑定域名 (Named Tunnel)?"
+            echo -e "\n[7/7] 绑定域名 (Named Tunnel)?"
             read -r -p "启用? (y/n) [n]: " bd_c
             local bind_on=0; local cf_tk=""
             if [[ "$bd_c" == "y" ]]; then bind_on=1; read -r -p "Token: " cf_tk; [[ -z "$cf_tk" ]] && bind_on=0; fi
 
             stop_all 
-            start_services "$p_mode" "$p_val" "$proto" "$fixed_port" "$ip_ver" "$xt_tk" "$bind_on" "$cf_tk"
+            start_services "$p_mode" "$p_val" "$proto" "$fixed_port" "$ip_ver" "$xt_tk" "$bind_on" "$cf_tk" "$cf_count"
             ;;
         2) stop_all; log success "已停止"; ;;
         3) stop_all; rm -rf "$BIN_DIR" "$CONFIG_FILE"; log success "已卸载"; ;;
-        4) if [[ -f "$CONFIG_FILE" ]]; then source "$CONFIG_FILE"; local pm=${proxy_mode:-0}; display_result "$temp_domain" "$ws_port" "$bind_enable" "$cf_proto" "$pm"; else log warn "未运行"; fi ;;
+        4) if [[ -f "$CONFIG_FILE" ]]; then source "$CONFIG_FILE"; local pm=${proxy_mode:-0}; display_result "$temp_domain" "$ws_port" "$bind_enable" "$cf_proto" "$pm" "${cf_count:-1}"; else log warn "未运行"; fi ;;
         0) exit 0 ;;
         *) log error "无效输入" ;;
     esac
