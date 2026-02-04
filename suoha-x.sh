@@ -50,6 +50,19 @@ optimize_system() {
             modprobe tcp_bbr 2>/dev/null
         fi
 
+=======
+        local cc_algo="bbr"
+        if grep -q "bbr2" /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+            cc_algo="bbr2"
+        else
+            modprobe tcp_bbr 2>/dev/null
+        fi
+
+        local qdisc_algo="fq_codel"
+        if tc qdisc add dev lo root fq >/dev/null 2>&1; then
+            tc qdisc del dev lo root >/dev/null 2>&1 || true
+            qdisc_algo="fq"
+        fi
         cat > /etc/sysctl.d/99-suoha-speed.conf <<EOF
 # --- 拥塞控制 ---
 net.core.default_qdisc = ${qdisc_algo}
